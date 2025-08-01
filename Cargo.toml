@@ -1,6 +1,6 @@
 [package]
 name = "compact_u64"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Endian-aware fixed-width integer codecs for ufotofu_codec"
@@ -12,10 +12,10 @@ dev = ["std", "arbitrary"]
 std = []
 
 [dependencies]
-ufotofu = "0.6.0"
+ufotofu = "0.7.0"
+ufotofu_codec = { version = "0.1.3" }
+ufotofu_codec_endian = { version = "0.2.0" }
 either = "1.10.0"
-ufotofu_codec = { version = "0.1.0" }
-ufotofu_codec_endian = { version = "0.1.0" }
 arbitrary = { version = "1.0.2", optional = true }
 
 # docs.rs-specific configuration
