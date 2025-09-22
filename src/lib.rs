@@ -667,3 +667,44 @@ impl RelativeDecodableCanonic<Tag, Infallible, NotMinimal> for CompactU64 {
 }
 
 impl RelativeDecodableSync<Tag, Infallible> for CompactU64 {}
+
+/// Decodes a `CompactU64` relative to a `Tag`; a type-level boolean indicates whether the encoding must be canonic or not.
+pub async fn relative_decode_cu64<const CANONIC: bool, P>(
+    producer: &mut P,
+    tag: &Tag,
+) -> Result<u64, DecodeError<P::Final, P::Error, Blame>>
+where
+    P: BulkProducer<Item = u8>,
+{
+    if CANONIC {
+        Ok(CompactU64::relative_decode_canonic(producer, tag)
+            .await
+            .map_err(|err| DecodeError::map_other(err, |_| Blame::TheirFault))?
+            .0)
+    } else {
+        Ok(CompactU64::relative_decode(producer, tag)
+            .await
+            .map_err(|err| DecodeError::map_other(err, |_| Blame::TheirFault))?
+            .0)
+    }
+}
+
+/// Decodes an eight-bit tag followed by the corresponding `CompactU64`; a type-level boolean indicates whether the encoding must be canonic or not.
+pub async fn decode_cu64<const CANONIC: bool, P>(
+    producer: &mut P,
+) -> Result<u64, DecodeError<P::Final, P::Error, Blame>>
+where
+    P: BulkProducer<Item = u8>,
+{
+    if CANONIC {
+        Ok(CompactU64::decode_canonic(producer)
+            .await
+            .map_err(|err| DecodeError::map_other(err, |_| Blame::TheirFault))?
+            .0)
+    } else {
+        Ok(CompactU64::decode(producer)
+            .await
+            .map_err(|err| DecodeError::map_other(err, |_| Blame::TheirFault))?
+            .0)
+    }
+}
