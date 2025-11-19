@@ -19,3 +19,6 @@ The general idea is the following:
 - If the tag has more than two bits, then each u64 that is less than the
   fourth-greatest tag can be encoded in the tag directly, followed by no further
   bytes.
+
+We provide
+[a more detailed specification here](https://willowprotocol.org/specs/encodings/index.html#compact_integers).

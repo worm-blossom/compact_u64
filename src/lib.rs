@@ -11,6 +11,8 @@
 //! - Each u64 that fits into one byte can be encoded by setting the tag to the fourth-greatest possible number and then encoding the u64 as an one-byte big-endian integer.
 //! - If the tag has more than two bits, then each u64 that is less than the fourth-greatest tag can be encoded in the tag directly, followed by no further bytes.
 //!
+//! We provide [a more detailed specification here](https://willowprotocol.org/specs/encodings/index.html#compact_integers).
+//!
 //! [`TagWidth`] is the type of possible tag widths (integers between two and eight inclusive). [`EncodingWidth`] is the type of the possible numbers of bytes that are needed for encoding a compact u64 beyond its tag: zero, one, two, four, or eight. [`EncodingWidth::min_width`] takes a `u64` and a [`TagWidth`], and returns the minimal [`EncodingWidth`] for compactly encoding the given number with a tag of the given width.
 //!
 //! The [`Tag`] type represents a tag: its width, together with the actual tag data. Its [`Tag::from_raw`] method can be used to create [`Tag`]s from single bytes when decoding compact u64s.
