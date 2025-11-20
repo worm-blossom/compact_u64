@@ -1,3 +1,5 @@
+Repo moved to https://codeberg.org/worm-blossom/compact_u64
+
 # Compact U64
 
 A machine-friendly varint, implemented in Rust.
