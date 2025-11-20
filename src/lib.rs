@@ -222,7 +222,7 @@ where
         1 => consumer.consume_item(n as u8).await,
         2 => consumer.encode_u16_be(n as u16).await,
         4 => consumer.encode_u32_be(n as u32).await,
-        8 => consumer.encode_u64_be(n as u64).await,
+        8 => consumer.encode_u64_be(n).await,
         _ => unreachable!(),
     }
 }
@@ -452,7 +452,9 @@ const fn min_width(n: u64, tag_width: TagWidth) -> EncodingWidth {
 const fn min_tag(n: u64, tag_width: TagWidth) -> Tag {
     let max_inline: u64 = (1_u64 << tag_width) - 4;
 
-    let data = if n < max_inline {
+    
+
+    if n < max_inline {
         n as u8
     } else {
         let max_tag = maximal_tag(tag_width);
@@ -466,9 +468,7 @@ const fn min_tag(n: u64, tag_width: TagWidth) -> Tag {
         } else {
             max_tag
         }
-    };
-
-    data
+    }
 }
 
 /// Returns the maximal tag of the given width as a Tag, i.e., `self.as_u8()` many one bits at the end, and everything else as zero bits. In other words, this computes `2^tag_width - 1`
