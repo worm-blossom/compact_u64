@@ -1,511 +1,532 @@
+//! A [variable-length encoding](https://en.wikipedia.org/wiki/Variable-length_encoding) for unsigned 64 bit integers.
+//!
+//! The core idea of this encoding scheme is to split the encoding into two parts: a *tag* which indicates how many bytes are used to encode the int, and then the actual *int encoding*, encoded in zero (sufficiently small ints can be inlined into the tag), one, two, four, or eight bytes. You can use tags of any width between two and eight bits — the wider the tag, the more int encodings can be inlined into the tag. The advantage of smaller tags is that multiple of them can fit into a single byte.
+//!
+//! We have a detailed [writeup on the encoding here](https://willowprotocol.org/specs/encodings/index.html#compact_integers). But to keep things self-contained, here is a precise definition of the possible codes for any `u64` `n` and any number `2 <= tag_width <= 8`:
+//!
+//! - You can use the numerically greatest possible `tag_width`-bit integer as the *tag*, and the eight-byte big-endian encoding of `n` as the *int encoding*.
+//! - If `n < 256^4`, you can use the numerically second-greatest possible `tag_width`-bit integer as the *tag*, and the four-byte big-endian encoding of `n` as the *int encoding*.
+//! - If `n < 256^2`, you can use the numerically third-greatest possible `tag_width`-bit integer as the *tag*, and the two-byte big-endian encoding of `n` as the *int encoding*.
+//! - If `n < 256`, you can use the numerically third-greatest possible `tag_width`-bit integer as the *tag*, and the one-byte encoding of `n` as the *int encoding*.
+//! - If `tag_width > 2`, and if `n` is less than the numerically fourth-greatest `tag_width`-bit integer, you can use the `tag_width`-bit encoding of `n` as the *tag*, and the empty string as the `int encoding`.
+//!
+//! Our implementation uses the [`codec`] module of [ufotofu](https://worm-blossom.org/ufotofu/) to abstract over actual byte storage.
+//!
+//! ## Encoding API
+//!
+//! Use [`write_tag`] to write *tags* at arbitrary offsets into any [`u8`], and use [`cu64_encode`] to write the minimal *int encoding* for any given tag width into a [`BulkConsumer<Item = u8>`](BulkConsumer).
+//!
+//! ```
+//! use ufotofu::codec_prelude::*;
+//! use compact_u64::*;
+//!
+//! // Encode two u64s using two four-bit tags, combining the tags into a single byte.
+//! # pollster::block_on(async {
+//! let n1 = 258; // Requires two bytes for its int encoding.
+//! let n2 = 7; // Can be inlined into the tag.
+//! let tag_width1 = 4;
+//! let tag_offset1 = 0;
+//! let tag_width2 = 4;
+//! let tag_offset2 = 4;
+//!
+//! let mut tag_byte = 0;
+//! // Write the four-bit tag for `n1` into `tag_byte`, starting at the most significant bit.
+//! write_tag(&mut tag_byte, tag_width1, tag_offset1, n1);
+//! // Write the four-bit tag for `n2` into `tag_byte`, starting at the fifth-most significant bit.
+//! write_tag(&mut tag_byte, tag_width2, tag_offset2, n2);
+//!
+//! // First four bits indicate a 2-byte int encoding, remaining four bits inline the integer `7`.
+//! assert_eq!(tag_byte, 0xd7);
+//!
+//! // The buffer into which we will write the encodings.
+//! let mut buf = [0; 3];
+//! let mut con = (&mut buf).into_consumer();
+//!
+//! // First write the byte containing the two tags.
+//! con.consume_item(tag_byte).await;
+//!
+//! // Writing the int encoding for `n1` will write the two-byte big-endian code for `n1`.
+//! cu64_encode(n1, tag_width1, &mut con).await.unwrap();
+//! // Writing the int encoding for `n2` is a no-op, because `n2` is inlined in the tag.
+//! cu64_encode(n2, tag_width2, &mut con).await.unwrap();
+//!
+//! assert_eq!(buf, [0xd7, 1, 2]);
+//! # Result::<(), ()>::Ok(())
+//! # });
+//! ```
+//!
+//! You can further use [`cu64_len_of_encoding`] to determine the number of bytes an *int encoding* would require for a given *tag*.
+//!
+//! ## Decoding API
+//!
+//! Use [`cu64_decode`] to decode the *int encoding* for some given *tag* from a [`BulkProducer<Item = u8>`](BulkProducer). Use [`cu64_decode_canonic`] if you want to reject non-minimal encodings.
+//!
+//! ```
+//! use ufotofu::codec_prelude::*;
+//! use compact_u64::*;
+//!
+//! // We will decode a single byte containing two four-bit tags, and then decode
+//! // two int encodings corresponding to the two tags.
+//! # pollster::block_on(async {
+//! let tag_width1 = 4;
+//! let tag_offset1 = 0;
+//! let tag_width2 = 4;
+//! let tag_offset2 = 4;
+//!
+//! // The encoding of two four-bit tags followed by two int encodings, for ints `258` and `7`.
+//! let mut pro = producer::clone_from_slice(&[0xd7, 1, 2][..]);
+//!
+//! // Read the byte that combines the two tags from the producer.
+//! let mut tag_byte = pro.produce_item().await?;
+//!
+//! // Decode the two ints.
+//! let n1 = cu64_decode(tag_byte, tag_width1, tag_offset1, &mut pro).await?;
+//! let n2 = cu64_decode(tag_byte, tag_width2, tag_offset2, &mut pro).await?;
+//!
+//! assert_eq!(n1, 258);
+//! assert_eq!(n2, 7);
+//! # Result::<(), DecodeError<(), Infallible, Infallible>>::Ok(())
+//! # });
+//! ```
+//!
+//! ## Standalone APIs
+//!
+//! The previous examples demonstrated the APIs for processing *tags* and *int encodings* separately. For the common case where you use an eight-bit *tag* immediately followed by the corresponding *int encoding*, we offer a more convenient API via [`cu64_encode_standalone`] and [`cu64_decode_standalone`] (and [`cu64_decode_canonic_standalone`] for rejecting non-minimal encodings):
+//!
+//! ```
+//! use ufotofu::codec_prelude::*;
+//! use compact_u64::*;
+//!
+//! # pollster::block_on(async {
+//! let mut buf = [0; 3];
+//! let mut con = (&mut buf).into_consumer();
+//!
+//! cu64_encode_standalone(258, &mut con).await.unwrap();
+//! assert_eq!(buf, [0xfd, 1, 2]);
+//!
+//! let n = cu64_decode_standalone(&mut producer::clone_from_slice(&buf[..])).await.unwrap();
+//! assert_eq!(n, 258);
+//! # });
+//! ```
+//!
+//! The same functionality is also exposed through the [`CompactU64`] type, which is a thin wrapper around `u64` that implements the [`Encodable`], [`EncodableKnownLength`], [`Decodable`], and [`DecodableCanonic`] traits.
+//!
+//! ```
+//! use ufotofu::codec_prelude::*;
+//! use compact_u64::*;
+//!
+//! # pollster::block_on(async {
+//! let mut buf = [0; 3];
+//! let mut con = (&mut buf).into_consumer();
+//!
+//! con.consume_encoded(&CompactU64(258)).await.unwrap();
+//! assert_eq!(buf, [0xfd, 1, 2]);
+//!
+//! let n: CompactU64 = producer::clone_from_slice(&buf[..]).produce_decoded().await.unwrap();
+//! assert_eq!(n.0, 258);
+//! # });
+//! ```
+//!
+//! ## Invalid Parameters
+//!
+//! The [offset of a tag](TagOffset) must always be a number between zero and seven (inclusive), and the [width of a tag](TagWidth) must always be a number between two and eight (inclusive). When a function takes a [`TagWidth`] and a [`TagOffset`], their sum must be at most eight.
+//!
+//! All functions in this crate may exhibit unspecified (but always safe) behaviour if these invariants are broken. When debug assertions are enabled, all functions in this crate are guaranteed to panic when these invariants are broken.
+
 #![no_std]
-
-//! # Compact u64
-//!
-//! Compact encodings for unsigned 64-bit integers. The general idea is the following:
-//!
-//! - Each encoding is preceeded by a tag of two to eight (inclusive) bits.
-//! - Each u64 can be encoded by setting the tag to the greatest possible number and then encoding the u64 as an eight-byte big-endian integer.
-//! - Each u64 that fits into four bytes can be encoded by setting the tag to the second-greatest possible number and then encoding the u64 as an four-byte big-endian integer.
-//! - Each u64 that fits into two bytes can be encoded by setting the tag to the third-greatest possible number and then encoding the u64 as an two-byte big-endian integer.
-//! - Each u64 that fits into one byte can be encoded by setting the tag to the fourth-greatest possible number and then encoding the u64 as an one-byte big-endian integer.
-//! - If the tag has more than two bits, then each u64 that is less than the fourth-greatest tag can be encoded in the tag directly, followed by no further bytes.
-//!
-//! We provide [a more detailed specification here](https://willowprotocol.org/specs/encodings/index.html#compact_integers).
-//!
-//! [`TagWidth`] is the type of possible tag widths (integers between two and eight inclusive). [`EncodingWidth`] is the type of the possible numbers of bytes that are needed for encoding a compact u64 beyond its tag: zero, one, two, four, or eight. [`EncodingWidth::min_width`] takes a `u64` and a [`TagWidth`], and returns the minimal [`EncodingWidth`] for compactly encoding the given number with a tag of the given width.
-//!
-//! The [`Tag`] type represents a tag: its width, together with the actual tag data. Its [`Tag::from_raw`] method can be used to create [`Tag`]s from single bytes when decoding compact u64s.
-//!
-//! Finally, the [`CompactU64`] type is the central type of the crate, a wrapper around `u64` that allows for encoding and decoding. It implements [`Encodable`] for emitting a minimal eight-bit tag followed by the minimal number of bytes for encoding the u64. The [`Decodable`] implementation conversely reads a single byte as an eight-bit tag, and then reads further bytes according to the tag to obtain the u64. There is also a [`DecodableCanonic`] implementation wihch errors if the decoded bytes are not the shortest possible encoding of the u64.
-//!
-//! Further, [`CompactU64`] implements [`RelativeEncodable`] for encoding only the number (but *not* the tag) relative to any given [`EncodingWidth`], and [`RelativeDecodable`] for decoding the number (but *not* a tag) relative to any given [`Tag`]. The corresponding [`RelativeDecodableCanonic`] implementation again enforces minimal encodings.
-
-#[cfg(feature = "std")]
-extern crate std;
-
-use core::convert::Infallible;
 use core::fmt::Display;
-
-use ufotofu::{BulkConsumer, BulkProducer};
-use ufotofu_codec::Blame;
-use ufotofu_codec::Decodable;
-use ufotofu_codec::DecodableCanonic;
-use ufotofu_codec::DecodableSync;
-use ufotofu_codec::DecodeError;
-use ufotofu_codec::Encodable;
-use ufotofu_codec::EncodableKnownSize;
-use ufotofu_codec::EncodableSync;
-use ufotofu_codec::RelativeDecodable;
-use ufotofu_codec::RelativeDecodableCanonic;
-use ufotofu_codec::RelativeDecodableSync;
-use ufotofu_codec::RelativeEncodable;
-use ufotofu_codec::RelativeEncodableKnownSize;
-use ufotofu_codec::RelativeEncodableSync;
-use ufotofu_codec_endian::{U16BE, U32BE, U64BE, U8BE};
 
 #[cfg(feature = "dev")]
 use arbitrary::Arbitrary;
 
-/// An opaque representation of one of the possible tag widths: 2, 3, 4, 5, 6, 7, or 8 bits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct TagWidth(u8);
+use ufotofu::codec_prelude::*;
 
-impl TagWidth {
-    /// Contructs an [`TagWidth`] from a given [`u8`], returing `None` if the argument is not between two and eight inclusive.
-    ///
-    /// ```
-    /// use compact_u64::*;
-    ///
-    /// let width = TagWidth::from_u8(4).unwrap();
-    /// assert_eq!(4, width.as_u8());
-    ///
-    /// assert_eq!(None, TagWidth::from_u8(9));
-    /// ```
-    pub const fn from_u8(num: u8) -> Option<Self> {
-        match num {
-            2..=8 => Some(Self(num)),
-            _ => None,
-        }
-    }
+/// The width of a *tag* — between two and eight inclusive.
+pub type TagWidth = u8;
 
-    /// Returns a [`TagWidth`] representing two.
-    ///
-    /// ```
-    /// use compact_u64::*;
-    ///
-    /// let width = TagWidth::two();
-    /// assert_eq!(2, width.as_u8());
-    /// ```
-    pub const fn two() -> Self {
-        TagWidth(2)
-    }
-
-    /// Returns a [`TagWidth`] representing three.
-    ///
-    /// ```
-    /// use compact_u64::*;
-    ///
-    /// let width = TagWidth::three();
-    /// assert_eq!(3, width.as_u8());
-    /// ```
-    pub const fn three() -> Self {
-        TagWidth(3)
-    }
-
-    /// Returns a [`TagWidth`] representing four.
-    ///
-    /// ```
-    /// use compact_u64::*;
-    ///
-    /// let width = TagWidth::four();
-    /// assert_eq!(4, width.as_u8());
-    /// ```
-    pub const fn four() -> Self {
-        TagWidth(4)
-    }
-
-    /// Returns a [`TagWidth`] representing five.
-    ///
-    /// ```
-    /// use compact_u64::*;
-    ///
-    /// let width = TagWidth::five();
-    /// assert_eq!(5, width.as_u8());
-    /// ```
-    pub const fn five() -> Self {
-        TagWidth(5)
-    }
-
-    /// Returns a [`TagWidth`] representing six.
-    ///
-    /// ```
-    /// use compact_u64::*;
-    ///
-    /// let width = TagWidth::six();
-    /// assert_eq!(6, width.as_u8());
-    /// ```
-    pub const fn six() -> Self {
-        TagWidth(6)
-    }
-
-    /// Returns a [`TagWidth`] representing seven.
-    ///
-    /// ```
-    /// use compact_u64::*;
-    ///
-    /// let width = TagWidth::seven();
-    /// assert_eq!(7, width.as_u8());
-    /// ```
-    pub const fn seven() -> Self {
-        TagWidth(7)
-    }
-
-    /// Returns a [`TagWidth`] representing eight.
-    ///
-    /// ```
-    /// use compact_u64::*;
-    ///
-    /// let width = TagWidth::eight();
-    /// assert_eq!(8, width.as_u8());
-    /// ```
-    pub const fn eight() -> Self {
-        TagWidth(8)
-    }
-
-    /// Retrieves the tag width as a [`u8`].
-    ///
-    /// ```
-    /// use compact_u64::*;
-    ///
-    /// let width = TagWidth::three();
-    /// assert_eq!(3, width.as_u8());
-    /// ```
-    pub const fn as_u8(&self) -> u8 {
-        self.0
-    }
-
-    /// Retrieves the tag width as a [`usize`].
-    ///
-    /// ```
-    /// use compact_u64::*;
-    ///
-    /// let width = TagWidth::three();
-    /// assert_eq!(3, width.as_usize());
-    /// ```
-    pub const fn as_usize(&self) -> usize {
-        self.0 as usize
-    }
-
-    /// Returns the maximal tag of the given width as a u8, i.e., a bunch of one bits in the least significant positions.
-    const fn maximal_tag(&self) -> u8 {
-        ((1_u16 << self.as_u8()) as u8).wrapping_sub(1)
-    }
+#[inline(always)]
+const fn assert_tag_width(tag_width: TagWidth) {
+    debug_assert!(2 <= tag_width);
+    debug_assert!(tag_width <= 8);
 }
 
-#[cfg(feature = "dev")]
-impl<'a> Arbitrary<'a> for TagWidth {
-    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> Result<Self, arbitrary::Error> {
-        let raw = u8::arbitrary(u)?;
-        match TagWidth::from_u8(raw % 8) {
-            None => Ok(TagWidth::eight()),
-            Some(tw) => Ok(tw),
-        }
-    }
-}
-
-/// An opaque representation of the possible width of a compact u64 encoding (excluding the tag): zero, one, two, four, or eight bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct EncodingWidth(u8);
-
-impl EncodingWidth {
-    /// Contructs an [`EncodingWidth`] from a given [`u8`], returing `None` if the argument is none of `0`, `1`, `2`, `4`, or `8`.
-    ///
-    /// ```
-    /// use compact_u64::*;
-    ///
-    /// let width = EncodingWidth::from_u8(4).unwrap();
-    /// assert_eq!(4, width.as_u8());
-    ///
-    /// assert_eq!(None, EncodingWidth::from_u8(5));
-    /// ```
-    pub const fn from_u8(num: u8) -> Option<Self> {
-        match num {
-            0 | 1 | 2 | 4 | 8 => Some(Self(num)),
-            _ => None,
-        }
-    }
-
-    /// Returns an [`EncodingWidth`] representing zero.
-    ///
-    /// ```
-    /// use compact_u64::*;
-    ///
-    /// let width = EncodingWidth::zero();
-    /// assert_eq!(0, width.as_u8());
-    /// ```
-    pub const fn zero() -> Self {
-        EncodingWidth(0)
-    }
-
-    /// Returns an [`EncodingWidth`] representing one.
-    ///
-    /// ```
-    /// use compact_u64::*;
-    ///
-    /// let width = EncodingWidth::one();
-    /// assert_eq!(1, width.as_u8());
-    /// ```
-    pub const fn one() -> Self {
-        EncodingWidth(1)
-    }
-
-    /// Returns an [`EncodingWidth`] representing two.
-    ///
-    /// ```
-    /// use compact_u64::*;
-    ///
-    /// let width = EncodingWidth::two();
-    /// assert_eq!(2, width.as_u8());
-    /// ```
-    pub const fn two() -> Self {
-        EncodingWidth(2)
-    }
-
-    /// Returns an [`EncodingWidth`] representing four.
-    ///
-    /// ```
-    /// use compact_u64::*;
-    ///
-    /// let width = EncodingWidth::four();
-    /// assert_eq!(4, width.as_u8());
-    /// ```
-    pub const fn four() -> Self {
-        EncodingWidth(4)
-    }
-
-    /// Returns an [`EncodingWidth`] representing eight.
-    ///
-    /// ```
-    /// use compact_u64::*;
-    ///
-    /// let width = EncodingWidth::eight();
-    /// assert_eq!(8, width.as_u8());
-    /// ```
-    pub const fn eight() -> Self {
-        EncodingWidth(8)
-    }
-
-    /// Retrieves the width as a [`u8`].
-    ///
-    /// ```
-    /// use compact_u64::*;
-    ///
-    /// let width = EncodingWidth::one();
-    /// assert_eq!(1, width.as_u8());
-    /// ```
-    pub const fn as_u8(&self) -> u8 {
-        self.0
-    }
-
-    /// Retrieves the width as a [`usize`].
-    ///
-    /// ```
-    /// use compact_u64::*;
-    ///
-    /// let width = EncodingWidth::one();
-    /// assert_eq!(1, width.as_usize());
-    /// ```
-    pub const fn as_usize(&self) -> usize {
-        self.0 as usize
-    }
-
-    /// Returns the least [`EncodingWidth`] a given [`u64`] can be represented in, given a tag of `tag_width` bits.
-    ///
-    /// ```
-    /// use compact_u64::*;
-    ///
-    /// assert_eq!(0u8, EncodingWidth::min_width(11, TagWidth::four()).into());
-    /// assert_eq!(1u8, EncodingWidth::min_width(12, TagWidth::four()).into());
-    /// assert_eq!(1u8, EncodingWidth::min_width(255, TagWidth::four()).into());
-    /// assert_eq!(2u8, EncodingWidth::min_width(256, TagWidth::four()).into());
-    /// assert_eq!(2u8, EncodingWidth::min_width(65535, TagWidth::four()).into());
-    /// assert_eq!(4u8, EncodingWidth::min_width(65536, TagWidth::four()).into());
-    /// assert_eq!(4u8, EncodingWidth::min_width(4294967295, TagWidth::four()).into());
-    /// assert_eq!(8u8, EncodingWidth::min_width(4294967296, TagWidth::four()).into());
-    /// assert_eq!(8u8, EncodingWidth::min_width(18446744073709551615, TagWidth::four()).into());
-    /// ```
-    pub const fn min_width(n: u64, tag_width: TagWidth) -> EncodingWidth {
-        let tag_width = tag_width.as_u8();
-        let max_inline = (1_u64 << tag_width) - 4;
-
-        if n < max_inline {
-            Self::zero()
-        } else if n < 256 {
-            Self::one()
-        } else if n < 256 * 256 {
-            Self::two()
-        } else if n < 256 * 256 * 256 * 256 {
-            Self::four()
-        } else {
-            Self::eight()
-        }
-    }
-}
-
-impl From<EncodingWidth> for u8 {
-    fn from(value: EncodingWidth) -> Self {
-        value.0
-    }
-}
-
-impl From<EncodingWidth> for usize {
-    fn from(value: EncodingWidth) -> Self {
-        value.0 as usize
-    }
-}
-
-/// A tag used for compact encoding. Combines a `Tagwidth` with a `u8` that stores the tag (in its least significant bits).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Tag {
-    width: TagWidth,
-    data: u8,
-}
-
-impl Tag {
-    /// Returns the tag of a given tag-width for encoding a [`u64`] in the least number of bytes.
-    ///
-    /// ```
-    /// use compact_u64::*;
-    ///
-    /// assert_eq!(11, Tag::min_tag(11, TagWidth::four()).data());
-    /// assert_eq!(12, Tag::min_tag(12, TagWidth::four()).data());
-    /// assert_eq!(12, Tag::min_tag(255, TagWidth::four()).data());
-    /// assert_eq!(13, Tag::min_tag(256, TagWidth::four()).data());
-    /// assert_eq!(13, Tag::min_tag(65535, TagWidth::four()).data());
-    /// assert_eq!(14, Tag::min_tag(65536, TagWidth::four()).data());
-    /// assert_eq!(14, Tag::min_tag(4294967295, TagWidth::four()).data());
-    /// assert_eq!(15, Tag::min_tag(4294967296, TagWidth::four()).data());
-    /// assert_eq!(15, Tag::min_tag(18446744073709551615, TagWidth::four()).data());
-    /// ```
-    pub const fn min_tag(n: u64, tag_width: TagWidth) -> Tag {
-        let max_inline: u64 = (1_u64 << tag_width.as_u8()) - 4;
-
-        let data = if n < max_inline {
-            n as u8
-        } else {
-            let max_tag = tag_width.maximal_tag();
-
-            if n < 256 {
-                max_tag - 3
-            } else if n < 256 * 256 {
-                max_tag - 2
-            } else if n < 256 * 256 * 256 * 256 {
-                max_tag - 1
-            } else {
-                max_tag
-            }
-        };
-
-        Tag {
-            width: tag_width,
-            data,
-        }
-    }
-
-    /// Creates a [`Tag`] from a `u8` of data, a [`TagWidth`], and an offset where in the `u8` the tag begins. An offset of `0` indicates the most significant bit, an offset of `7` indicates the least significant bit. If the sum of width and offset is greater than eight, the function panics.
-    ///
-    /// ```
-    /// use compact_u64::*;
-    ///
-    /// let tag = Tag::from_raw(0b0011_0100, TagWidth::four(), 2);
-    /// assert_eq!(0b0000_1101, tag.data());
-    /// assert_eq!(TagWidth::four(), tag.tag_width());
-    /// assert_eq!(EncodingWidth::two(), tag.encoding_width());
-    /// ```
-    pub fn from_raw(raw: u8, width: TagWidth, offset: usize) -> Tag {
-        match 8_usize.checked_sub(offset + width.as_usize()) {
-            None => panic!("Invalid tag offset: {}", offset),
-            Some(shift_by) => {
-                let max_tag: u8 = width.maximal_tag();
-
-                Tag {
-                    width,
-                    data: (raw >> shift_by) & max_tag,
-                }
-            }
-        }
-    }
-
-    /// Returns the width of this [`Tag`].
-    pub fn tag_width(&self) -> TagWidth {
-        self.width
-    }
-
-    /// Returns the data of this [`Tag`], stored in the `self.width()` many least significant bits.
-    pub fn data(&self) -> u8 {
-        self.data
-    }
-
-    /// Returns the data of this [`Tag`], stored `self.width()` many bits starting at the given offset. An offset of zero denotes the most significant bit, an offset of seven the least significant bit.
-    ///
-    /// Panics if the sum of `offset` and the width of the tag is strictly greater than eight.
-    pub fn data_at_offset(&self, offset: u8) -> u8 {
-        debug_assert!(offset.saturating_add(self.tag_width().as_u8()) <= 8);
-        self.data() << (8 - (self.tag_width().as_u8() + offset))
-    }
-
-    /// Returns the width of the integer encoding indicated by this tag.
-    pub fn encoding_width(&self) -> EncodingWidth {
-        match self.tag_width().maximal_tag() - self.data {
-            0 => EncodingWidth::eight(),
-            1 => EncodingWidth::four(),
-            2 => EncodingWidth::two(),
-            3 => EncodingWidth::one(),
-            _ => EncodingWidth::zero(),
-        }
-    }
-}
-
-#[cfg(feature = "dev")]
-impl<'a> Arbitrary<'a> for Tag {
-    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> Result<Self, arbitrary::Error> {
-        let width = TagWidth::arbitrary(u)?;
-        let mask = width.maximal_tag();
-        let raw = u8::arbitrary(u)?;
-        let data = raw & mask;
-
-        Ok(Tag { width, data })
-    }
-}
-
-/// A thin wrapper around `u64` that allows for minimal encoding relative to arbitrary [`EncodingWidth`]s, and for decoding relative to arbitrary [`Tag`]s.
+/// The offset of a *tag* within a [`TagByte`] — between zero (most significant) and seven (least significant).
 ///
-/// The implementation of [`DecodableCanonic`] first decodes a value and then checks whether a lesser tag could have also been used to encode the decoded value. If so, it reports an error.
+/// Zero indicates the most significant bit, seven indicates the least significant bit.
+pub type TagOffset = u8;
+
+#[inline(always)]
+const fn assert_tag_offset(tag_offset: TagOffset, tag_width: TagWidth) {
+    debug_assert!(tag_offset + tag_width <= 8);
+}
+
+/// A byte storing some number of *tags*.
+pub type TagByte = u8;
+
+// Always one of 0, 1, 2, 4, or 8.
+type EncodingWidth = usize;
+
+// A byte whose least significant bits store a tag, and whose other bits are set to zero.
+type Tag = u8;
+
+/// Writes the minimal tag for the given u64 `n` into the `tag_byte`, for a given [`TagWidth`] and at a given [`TagOffset`].
 ///
-/// Also implements absolute encoding and decoding by prefixing the number with its eight-bit tag.
+/// Invariant: `tag_width + tag_offset <= 8`, else anything (safe) may happen. When debug assertions are enabled, this function will panic if the invariant is broken.
 ///
 /// ```
+/// use compact_u64::write_tag;
+///
+/// let mut tag_byte1 = 0;
+/// write_tag(&mut tag_byte1, 3, 2, u64::MAX);
+/// assert_eq!(tag_byte1, 0b0011_1000);
+///
+/// let mut tag_byte2 = 0;
+/// write_tag(&mut tag_byte2, 3, 2, 258);
+/// assert_eq!(tag_byte2, 0b0010_1000);
+///
+/// let mut tag_byte3 = 0;
+/// write_tag(&mut tag_byte3, 3, 2, 3);
+/// assert_eq!(tag_byte3, 0b0001_1000);
+/// ```
+pub fn write_tag(tag_byte: &mut TagByte, tag_width: TagWidth, tag_offset: TagOffset, n: u64) {
+    assert_tag_width(tag_width);
+    assert_tag_offset(tag_offset, tag_width);
+    debug_assert!(tag_width + tag_offset <= 8);
+
+    let new_tag_byte: TagByte = min_tag(n, tag_width) << (8 - (tag_offset + tag_width));
+    *tag_byte |= new_tag_byte;
+}
+
+/// Writes the *int encoding* of `n` for the minimal *tag* of width `tag_width` into the `consumer`.
+///
+/// ```
+/// use ufotofu::codec_prelude::*;
 /// use compact_u64::*;
-/// use ufotofu_codec::*;
+/// # pollster::block_on(async {
+/// let mut buf = [0; 2];
+/// let mut con = (&mut buf).into_consumer();
 ///
-/// assert_eq!(
-///     &[123],
-///     &CompactU64(123).sync_relative_encode_into_boxed_slice(&EncodingWidth::one())[..],
-/// );
+/// cu64_encode(258, 8, &mut con).await.unwrap();
+/// assert_eq!(buf, [1, 2]);
+/// # Result::<(), ()>::Ok(())
+/// # });
+/// ```
+pub async fn cu64_encode<C>(n: u64, tag_width: TagWidth, consumer: &mut C) -> Result<(), C::Error>
+where
+    C: BulkConsumer<Item = u8> + ?Sized,
+{
+    let encoding_width = cu64_len_of_encoding(tag_width, n);
+
+    match encoding_width {
+        0 => Ok(()),
+        1 => consumer.consume_item(n as u8).await,
+        2 => consumer.encode_u16_be(n as u16).await,
+        4 => consumer.encode_u32_be(n as u32).await,
+        8 => consumer.encode_u64_be(n as u64).await,
+        _ => unreachable!(),
+    }
+}
+
+/// Writes the minimal eight-bit *tag* for `n` and then the corresponding minimal *int encoding* into the `consumer`.
 ///
-/// assert_eq!(
-///     123,
-///     CompactU64::sync_relative_decode_from_slice(&[], &Tag::from_raw(123, TagWidth::eight(), 0)).unwrap().0,
-/// );
+/// ```
+/// use ufotofu::codec_prelude::*;
+/// use compact_u64::*;
 ///
-/// assert_eq!(
-///     123,
-///     CompactU64::sync_relative_decode_from_slice(&[123], &Tag::from_raw(252, TagWidth::eight(), 0)).unwrap().0,
-/// );
-/// assert_eq!(
-///     123,
-///     CompactU64::sync_relative_decode_from_slice(&[0, 123], &Tag::from_raw(253, TagWidth::eight(), 0)).unwrap().0,
-/// );
+/// # pollster::block_on(async {
+/// let mut buf = [0; 3];
+/// let mut con = (&mut buf).into_consumer();
 ///
-/// assert!(
-///     CompactU64::sync_relative_decode_canonic_from_slice(&[0, 123], &Tag::from_raw(253, TagWidth::eight(), 0)).is_err(),
-/// );
+/// cu64_encode_standalone(258, &mut con).await.unwrap();
+/// assert_eq!(buf, [0xfd, 1, 2]);
+/// # });
+/// ```
+pub async fn cu64_encode_standalone<C>(n: u64, consumer: &mut C) -> Result<(), C::Error>
+where
+    C: BulkConsumer<Item = u8> + ?Sized,
+{
+    let tag = min_tag(n, 8);
+    consumer.consume_item(tag).await?;
+    cu64_encode(n, 8, consumer).await
+}
+
+/// Returns the length of the *int encoding* of `n` when using a minimal *tag* of the given `tag_width`.
 ///
-/// assert_eq!(
-///     &[123],
-///     &CompactU64(123).sync_encode_into_boxed_slice()[..],
-/// );
+/// ```
+/// use ufotofu::codec_prelude::*;
+/// use compact_u64::*;
 ///
-/// assert_eq!(
-///     123,
-///     CompactU64::sync_decode_from_slice(&[123]).unwrap().0,
-/// );
+/// assert_eq!(cu64_len_of_encoding(8, 111), 0);
+/// assert_eq!(cu64_len_of_encoding(8, 254), 1);
+/// assert_eq!(cu64_len_of_encoding(8, 258), 2);
+/// ```
+pub const fn cu64_len_of_encoding(tag_width: TagWidth, n: u64) -> usize {
+    min_width(n, tag_width)
+}
+
+/// Reads the *int encoding* of `n` for the given *tag* from the `producer`.
+///
+/// The *tag* of width `tag_width` is read at offset `tag_offset` from the `tag_byte`.
+///
+/// ```
+/// use ufotofu::codec_prelude::*;
+/// use compact_u64::*;
+/// # pollster::block_on(async {
+/// let mut buf = [1, 2];
+///
+/// let n = cu64_decode(
+///     0b0010_1000, // the tag byte, the actual tag being `101` (the outer zeros are ignored)
+///     3, // the tag width
+///     2, // the tag offset
+///     &mut producer::clone_from_slice(&buf[..]),
+/// ).await.unwrap();
+/// assert_eq!(n, 258);
+/// # Result::<(), ()>::Ok(())
+/// # });
+/// ```
+pub async fn cu64_decode<P>(
+    tag_byte: TagByte,
+    tag_width: TagWidth,
+    tag_offset: TagOffset,
+    producer: &mut P,
+) -> Result<u64, DecodeError<P::Final, P::Error, Infallible>>
+where
+    P: BulkProducer<Item = u8> + ?Sized,
+{
+    let tag = extract_tag(tag_byte, tag_width, tag_offset);
+    let encoding_width = encoding_width_from_tag(tag, tag_width);
+
+    Ok(match encoding_width {
+        0 => tag as u64,
+        1 => producer.produce_item().await? as u64,
+        2 => producer.decode_u16_be().await? as u64,
+        4 => producer.decode_u32_be().await? as u64,
+        8 => producer.decode_u64_be().await?,
+        _ => unreachable!(),
+    })
+}
+
+/// Reads an eight-bit *tag* from the `producer`, then reads the corresponding *int encoding* from the `producer`, and returns the decoded [`u64`].
+///
+/// ```
+/// use ufotofu::codec_prelude::*;
+/// use compact_u64::*;
+///
+/// # pollster::block_on(async {
+/// let n = cu64_decode_standalone(
+///     &mut producer::clone_from_slice(&[0xfd, 1, 2][..]),
+/// ).await.unwrap();
+///
+/// assert_eq!(n, 258);
+/// # });
+/// ```
+pub async fn cu64_decode_standalone<P>(
+    producer: &mut P,
+) -> Result<u64, DecodeError<P::Final, P::Error, Infallible>>
+where
+    P: BulkProducer<Item = u8> + ?Sized,
+{
+    let tag = producer.produce_item().await?;
+    cu64_decode(tag, 8, 0, producer).await
+}
+
+/// Reads the *int encoding* of `n` for the given *tag* from the `producer`, yielding an error if the encoding was not minimal.
+///
+/// The *tag* of width `tag_width` is read at offset `tag_offset` from the `tag_byte`.
+///
+/// ```
+/// use ufotofu::codec_prelude::*;
+/// use compact_u64::*;
+/// # pollster::block_on(async {
+/// let mut buf = [1, 2];
+///
+/// let n = cu64_decode_canonic(
+///     0b0010_1000, // the tag byte, the actual tag being `101` (the outer zeros are ignored)
+///     3, // the tag width
+///     2, // the tag offset
+///     &mut producer::clone_from_slice(&buf[..]),
+/// ).await.unwrap();
+/// assert_eq!(n, 258);
+///
+/// let mut non_minimal_buf = [0, 0, 1, 2];
+///
+/// assert!(cu64_decode_canonic(
+///     0xfe, // an eight-bit tag indicating an *int encoding* of four bytes
+///     8, // the tag width
+///     0, // the tag offset
+///     &mut producer::clone_from_slice(&buf[..]),
+/// ).await.is_err());
+/// # Result::<(), ()>::Ok(())
+/// # });
+/// ```
+pub async fn cu64_decode_canonic<P>(
+    tag_byte: TagByte,
+    tag_width: TagWidth,
+    tag_offset: TagOffset,
+    producer: &mut P,
+) -> Result<u64, DecodeError<P::Final, P::Error, NotMinimal>>
+where
+    P: BulkProducer<Item = u8> + ?Sized,
+{
+    let decoded = cu64_decode(tag_byte, tag_width, tag_offset, producer)
+        .await
+        .map_err(|err| err.map_other(|_| unreachable!()))?;
+
+    if extract_tag(tag_byte, tag_width, tag_offset) == min_tag(decoded, tag_width) {
+        Ok(decoded)
+    } else {
+        Err(DecodeError::Other(NotMinimal))
+    }
+}
+
+/// Reads an eight-bit *tag* from the `producer`, then reads the corresponding *int encoding* from the `producer`, and returns the decoded [`u64`], or an error if the encoding was not minimal.
+///
+/// ```
+/// use ufotofu::codec_prelude::*;
+/// use compact_u64::*;
+///
+/// # pollster::block_on(async {
+/// let n = cu64_decode_canonic_standalone(
+///     &mut producer::clone_from_slice(&[0xfd, 1, 2][..]),
+/// ).await.unwrap();
+/// assert_eq!(n, 258);
+///
+/// assert!(cu64_decode_canonic_standalone(
+///     &mut producer::clone_from_slice(&[0xfe, 0, 0, 1, 2][..]), // int encoding in four bytes
+/// ).await.is_err());
+/// # });
+/// ```
+pub async fn cu64_decode_canonic_standalone<P>(
+    producer: &mut P,
+) -> Result<u64, DecodeError<P::Final, P::Error, NotMinimal>>
+where
+    P: BulkProducer<Item = u8> + ?Sized,
+{
+    let tag = producer.produce_item().await?;
+    cu64_decode_canonic(tag, 8, 0, producer).await
+}
+
+fn extract_tag(tag_byte: TagByte, tag_width: TagWidth, tag_offset: TagOffset) -> Tag {
+    assert_tag_width(tag_width);
+    assert_tag_offset(tag_offset, tag_width);
+
+    match 8_usize.checked_sub((tag_offset as usize) + (tag_width as usize)) {
+        None => panic!("Invalid tag offset: {}", tag_offset),
+        Some(shift_by) => {
+            let max_tag = maximal_tag(tag_width);
+
+            (tag_byte >> shift_by) & max_tag
+        }
+    }
+}
+
+fn encoding_width_from_tag(tag: Tag, tag_width: TagWidth) -> EncodingWidth {
+    match maximal_tag(tag_width) - tag {
+        0 => 8,
+        1 => 4,
+        2 => 2,
+        3 => 1,
+        _ => 0,
+    }
+}
+
+/// Returns the least [`EncodingWidth`] a given [`u64`] can be represented in, given a tag of `tag_width` bits.
+const fn min_width(n: u64, tag_width: TagWidth) -> EncodingWidth {
+    assert_tag_width(tag_width);
+
+    let max_inline = (1_u64 << tag_width) - 4;
+
+    if n < max_inline {
+        0
+    } else if n < 256 {
+        1
+    } else if n < 256 * 256 {
+        2
+    } else if n < 256 * 256 * 256 * 256 {
+        4
+    } else {
+        8
+    }
+}
+
+const fn min_tag(n: u64, tag_width: TagWidth) -> Tag {
+    let max_inline: u64 = (1_u64 << tag_width) - 4;
+
+    let data = if n < max_inline {
+        n as u8
+    } else {
+        let max_tag = maximal_tag(tag_width);
+
+        if n < 256 {
+            max_tag - 3
+        } else if n < 256 * 256 {
+            max_tag - 2
+        } else if n < 256 * 256 * 256 * 256 {
+            max_tag - 1
+        } else {
+            max_tag
+        }
+    };
+
+    data
+}
+
+/// Returns the maximal tag of the given width as a Tag, i.e., `self.as_u8()` many one bits at the end, and everything else as zero bits. In other words, this computes `2^tag_width - 1`
+const fn maximal_tag(tag_width: TagWidth) -> Tag {
+    assert_tag_width(tag_width);
+
+    ((1_u16 << tag_width) as u8).wrapping_sub(1)
+}
+
+/// An error indicating that a compact u64 encoding was not minimal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotMinimal;
+
+impl Display for NotMinimal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "Expected a canonic compact u64 encoding, but got a non-minimal encoding instead.."
+        )
+    }
+}
+
+impl From<NotMinimal> for Blame {
+    fn from(_value: NotMinimal) -> Self {
+        Blame::TheirFault
+    }
+}
+
+impl core::error::Error for NotMinimal {}
+
+impl From<Infallible> for NotMinimal {
+    fn from(_value: Infallible) -> Self {
+        unreachable!()
+    }
+}
+
+/// A wrapper around [`u64`], implementing the [ufotofu codec traits](codec).
+///
+/// The [encoding relation](codec) implemented by the [`Encodable`], [`EncodableKnownLength`], [`Decodable`], and [`DecodableCanonic`] impls of this type works by first encoding an eight-bit *tag* for the int, followed by the corresponding *int encoding*.
+///
+/// ```
+/// use ufotofu::codec_prelude::*;
+/// use compact_u64::*;
+///
+/// # pollster::block_on(async {
+/// let mut buf = [0; 3];
+/// let mut con = (&mut buf).into_consumer();
+///
+/// con.consume_encoded(&CompactU64(258)).await.unwrap();
+/// assert_eq!(buf, [0xfd, 1, 2]);
+///
+/// let n: CompactU64 = producer::clone_from_slice(&buf[..]).produce_decoded().await.unwrap();
+/// assert_eq!(n.0, 258);
+/// # });
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-#[cfg_attr(feature = "dev", derive(Arbitrary))]
 pub struct CompactU64(
-    /// The wrapped `u64`.
+    /// The wrapped [`u64`].
     pub u64,
 );
 
@@ -521,192 +542,86 @@ impl From<CompactU64> for u64 {
     }
 }
 
-/// Produces the shortest possible encodings relative to a given `EncodingWidth`. **Careful: Does not encode any tag itself. Use [`Tag::min_tag`] to obtain the corresponding tag.**
-impl RelativeEncodable<EncodingWidth> for CompactU64 {
-    async fn relative_encode<C>(&self, consumer: &mut C, r: &EncodingWidth) -> Result<(), C::Error>
-    where
-        C: BulkConsumer<Item = u8>,
-    {
-        match r.as_u8() {
-            0 => Ok(()),
-            1 => U8BE(self.0 as u8).encode(consumer).await,
-            2 => U16BE(self.0 as u16).encode(consumer).await,
-            4 => U32BE(self.0 as u32).encode(consumer).await,
-            8 => U64BE(self.0).encode(consumer).await,
-            _ => unreachable!(),
-        }
+#[cfg(feature = "dev")]
+impl<'a> Arbitrary<'a> for CompactU64 {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        Ok(CompactU64(u64::arbitrary(u)?))
+    }
+
+    #[inline]
+    fn size_hint(depth: usize) -> (usize, Option<usize>) {
+        u64::size_hint(depth)
     }
 }
 
-impl RelativeEncodableKnownSize<EncodingWidth> for CompactU64 {
-    fn relative_len_of_encoding(&self, r: &EncodingWidth) -> usize {
-        r.as_usize()
-    }
-}
-
-impl RelativeEncodableSync<EncodingWidth> for CompactU64 {}
-
-impl RelativeDecodable<Tag, Infallible> for CompactU64 {
-    async fn relative_decode<P>(
-        producer: &mut P,
-        r: &Tag,
-    ) -> Result<Self, DecodeError<P::Final, P::Error, Infallible>>
-    where
-        P: BulkProducer<Item = u8>,
-        Self: Sized,
-    {
-        match r.encoding_width().as_u8() {
-            0 => Ok(CompactU64(r.data() as u64)),
-            1 => Ok(CompactU64(U8BE::decode(producer).await?.0 as u64)),
-            2 => Ok(CompactU64(U16BE::decode(producer).await?.0 as u64)),
-            4 => Ok(CompactU64(U32BE::decode(producer).await?.0 as u64)),
-            8 => Ok(CompactU64(U64BE::decode(producer).await?.0)),
-            _ => unreachable!(),
-        }
-    }
-}
-
-/// Writes an eight-bit tag before the big-endian number.
+/// Implements encoding by first encoding a byte storing the minimal 8-bit tag for self, followed by the corresponding compact u64 encoding.
 impl Encodable for CompactU64 {
+    /// Implements encoding by first encoding a byte storing the minimal 8-bit tag for self, followed by the corresponding compact u64 encoding.
     async fn encode<C>(&self, consumer: &mut C) -> Result<(), C::Error>
     where
-        C: BulkConsumer<Item = u8>,
+        C: BulkConsumer<Item = u8> + ?Sized,
     {
-        let tag = Tag::min_tag(self.0, TagWidth::eight());
-        consumer.consume(tag.data()).await?;
-        self.relative_encode(consumer, &tag.encoding_width()).await
+        cu64_encode_standalone(self.0, consumer).await
     }
 }
 
-impl EncodableKnownSize for CompactU64 {
+impl EncodableKnownLength for CompactU64 {
     fn len_of_encoding(&self) -> usize {
-        let tag = Tag::min_tag(self.0, TagWidth::eight());
-        1 + self.relative_len_of_encoding(&tag.encoding_width())
+        1 + cu64_len_of_encoding(8, self.0)
     }
 }
 
-impl EncodableSync for CompactU64 {}
-
-/// Expects an eight-bit tag before the big-endian number.
+/// Implements decoding by first decoding a byte storing an 8-bit tag, followed by the corresponding compact u64 encoding.
 impl Decodable for CompactU64 {
     type ErrorReason = Infallible;
 
+    /// Implements decoding by first decoding a byte storing an 8-bit tag, followed by the corresponding compact u64 encoding.
     async fn decode<P>(
         producer: &mut P,
     ) -> Result<Self, DecodeError<P::Final, P::Error, Self::ErrorReason>>
     where
-        P: BulkProducer<Item = u8>,
+        P: BulkProducer<Item = u8> + ?Sized,
         Self: Sized,
     {
-        let tag_byte = producer.produce_item().await?;
-        let tag = Tag::from_raw(tag_byte, TagWidth::eight(), 0);
-        CompactU64::relative_decode(producer, &tag).await
+        Ok(Self(cu64_decode_standalone(producer).await?))
     }
 }
 
+/// Implements decoding by first decoding a byte storing an 8-bit tag, followed by the corresponding compact u64 encoding, and emitting an error if the encoding was not minimal.
 impl DecodableCanonic for CompactU64 {
     type ErrorCanonic = NotMinimal;
 
+    /// Implements decoding by first decoding a byte storing an 8-bit tag, followed by the corresponding compact u64 encoding, and emitting an error if the encoding was not minimal.
     async fn decode_canonic<P>(
         producer: &mut P,
     ) -> Result<Self, DecodeError<P::Final, P::Error, Self::ErrorCanonic>>
     where
-        P: BulkProducer<Item = u8>,
+        P: BulkProducer<Item = u8> + ?Sized,
         Self: Sized,
     {
-        let tag_byte = producer.produce_item().await?;
-        let tag = Tag::from_raw(tag_byte, TagWidth::eight(), 0);
-        CompactU64::relative_decode_canonic(producer, &tag).await
+        Ok(Self(cu64_decode_canonic_standalone(producer).await?))
     }
 }
 
-impl DecodableSync for CompactU64 {}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// Marker unit struct to indicate that a compact u64 encoding was not minimal, as would be required for canonic decoding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NotMinimal;
-
-impl Display for NotMinimal {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "A compact u64 decoding was not minimal.")
+    #[test]
+    fn test_min_width() {
+        assert_eq!(0usize, min_width(11, 4));
+        assert_eq!(1usize, min_width(12, 4));
+        assert_eq!(1usize, min_width(255, 4));
+        assert_eq!(2usize, min_width(256, 4));
+        assert_eq!(2usize, min_width(65535, 4));
+        assert_eq!(4usize, min_width(65536, 4));
+        assert_eq!(4usize, min_width(4294967295, 4));
+        assert_eq!(8usize, min_width(4294967296, 4));
+        assert_eq!(8usize, min_width(18446744073709551615, 4));
     }
-}
 
-impl From<NotMinimal> for Blame {
-    fn from(_value: NotMinimal) -> Self {
-        Blame::TheirFault
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for NotMinimal {}
-
-impl From<Infallible> for NotMinimal {
-    fn from(_value: Infallible) -> Self {
-        unreachable!()
-    }
-}
-
-impl RelativeDecodableCanonic<Tag, Infallible, NotMinimal> for CompactU64 {
-    async fn relative_decode_canonic<P>(
-        producer: &mut P,
-        r: &Tag,
-    ) -> Result<Self, DecodeError<P::Final, P::Error, NotMinimal>>
-    where
-        P: BulkProducer<Item = u8>,
-        Self: Sized,
-    {
-        let decoded = Self::relative_decode(producer, r)
-            .await
-            .map_err(DecodeError::map_other_from)?;
-
-        if r == &Tag::min_tag(decoded.0, r.tag_width()) {
-            Ok(decoded)
-        } else {
-            Err(DecodeError::Other(NotMinimal))
-        }
-    }
-}
-
-impl RelativeDecodableSync<Tag, Infallible> for CompactU64 {}
-
-/// Decodes a `CompactU64` relative to a `Tag`; a type-level boolean indicates whether the encoding must be canonic or not.
-pub async fn relative_decode_cu64<const CANONIC: bool, P>(
-    producer: &mut P,
-    tag: &Tag,
-) -> Result<u64, DecodeError<P::Final, P::Error, Blame>>
-where
-    P: BulkProducer<Item = u8>,
-{
-    if CANONIC {
-        Ok(CompactU64::relative_decode_canonic(producer, tag)
-            .await
-            .map_err(|err| DecodeError::map_other(err, |_| Blame::TheirFault))?
-            .0)
-    } else {
-        Ok(CompactU64::relative_decode(producer, tag)
-            .await
-            .map_err(|err| DecodeError::map_other(err, |_| Blame::TheirFault))?
-            .0)
-    }
-}
-
-/// Decodes an eight-bit tag followed by the corresponding `CompactU64`; a type-level boolean indicates whether the encoding must be canonic or not.
-pub async fn decode_cu64<const CANONIC: bool, P>(
-    producer: &mut P,
-) -> Result<u64, DecodeError<P::Final, P::Error, Blame>>
-where
-    P: BulkProducer<Item = u8>,
-{
-    if CANONIC {
-        Ok(CompactU64::decode_canonic(producer)
-            .await
-            .map_err(|err| DecodeError::map_other(err, |_| Blame::TheirFault))?
-            .0)
-    } else {
-        Ok(CompactU64::decode(producer)
-            .await
-            .map_err(|err| DecodeError::map_other(err, |_| Blame::TheirFault))?
-            .0)
+    #[test]
+    fn test_maximal_tag() {
+        assert_eq!(maximal_tag(5), 0b0001_1111);
     }
 }

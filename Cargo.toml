@@ -1,22 +1,19 @@
 [package]
 name = "compact_u64"
-version = "0.2.1"
-edition = "2021"
+version = "0.3.0"
+edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "A machine-friendly varint."
 
 [features]
-default = ["std"]
-dev = ["std", "arbitrary"]
-# Provide functionality that relies on the std library. Enabled by default.
-std = []
+dev = ["dep:arbitrary"]
 
 [dependencies]
-ufotofu = "0.7.0"
-ufotofu_codec = { version = "0.1.3" }
-ufotofu_codec_endian = { version = "0.2.0" }
-either = "1.10.0"
-arbitrary = { version = "1.0.2", optional = true }
+ufotofu = "0.8.2"
+arbitrary = { version = "1.0.2", features = ["derive"], optional = true }
+
+[dev-dependencies]
+pollster = "0.4.0"
 
 # docs.rs-specific configuration
 [package.metadata.docs.rs]
